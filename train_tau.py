@@ -6,21 +6,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch /c23034/wbh/code/CBS_LLM4
 import ast
 import json
 import os
-import pdb
-import random
-import re
 from typing import List, Optional
 
 import fire
-import numpy as np
 import pandas as pd
-from requests import get
 import torch
-from tqdm import tqdm
 import transformers
 from accelerate import Accelerator
 
-from torch.nn import CrossEntropyLoss
 from datasets import Dataset
 
 from peft import (
@@ -32,14 +25,9 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    LlamaForCausalLM,
-    LlamaTokenizer,
     DataCollatorForSeq2Seq,
 )
 
-from Trie import Trie
-import torch.nn.functional as F
-import copy
 from utils import get_prompt
 
 
@@ -109,17 +97,14 @@ class CustomTrainer(transformers.Trainer):
         neg_logits = torch.exp(shift_logits / self.tau)
         neg_loss = torch.log(neg_logits.sum(dim=-1))
 
-        # if self.loss_type == 0:
         loss = (pos_loss + neg_loss).mean()
-        # elif self.loss_type == 1:
-        #     loss = self.tau * (pos_loss + neg_loss).mean()
 
         return (loss, outputs) if return_outputs else loss
 
 
 def train(
+    dataset_name: str,
     base_model: str = "/c23034/wbh/Llama3_Checkpoints/",
-    dataset_name: str = "amazon_game",
     sample: int = -1,
     seed: int = 42,
     # training hyperparams
@@ -136,23 +121,20 @@ def train(
         "v_proj",
     ],
     train_on_inputs: int = 0,
-    # 额外的loss参数
     tau: float = 1,
-    # loss_type: int = 0,
 ):
     params = locals()
     transformers.set_seed(seed)
     accelerator = Accelerator()
 
-    model_name = re.search(r"Llama[^_]+", base_model).group(0)
     instruction_prompt, history_prompt = get_prompt(dataset_name)
 
-    id2title_path = os.path.join("/c23034/wbh/code/CBS_LLM4Rec/data/", dataset_name, "id2name4Rec.json")
+    id2title_path = os.path.join("./data/", dataset_name, "id2name4Rec.json")
     with open(id2title_path, "r") as file:
         data = json.load(file)
     id2title_dict = {int(k): v for k, v in data.items()}
 
-    train_data_path = os.path.join("/c23034/wbh/code/CBS_LLM4Rec/data/", dataset_name, f"train_{sample}.csv")
+    train_data_path = os.path.join("./data/", dataset_name, f"train_{sample}.csv")
     train_data = generate_list_from_csv(
         train_data_path=train_data_path,
         id2title_dict=id2title_dict,
@@ -161,7 +143,7 @@ def train(
     )
 
     father_path = os.path.join(
-        f"/c23034/wbh/code/CBS_LLM4Rec/save_lora_model_{model_name}",
+        f"./save_lora_model/",
         dataset_name,
         f"sample{sample}_epoch{num_epochs}_tau{tau}",
     )
@@ -183,29 +165,17 @@ def train(
 
     """加载了预训练的模型和对应的分词器"""
     bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-    if "Llama3" in base_model:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            quantization_config=bnb_config,
-            torch_dtype=torch.bfloat16,
-            device_map={"": int(os.environ.get("LOCAL_RANK") or 0)},
-        )
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
-        tokenizer.add_special_tokens({"pad_token": "<pad>"})
-        model.resize_token_embeddings(len(tokenizer))
-        model.config.pad_token_id = tokenizer.pad_token_id
-        tokenizer.padding_side = "left"
-    elif "Llama2" in base_model:
-        model = LlamaForCausalLM.from_pretrained(
-            base_model,
-            quantization_config=bnb_config,
-            torch_dtype=torch.bfloat16,
-            device_map={"": int(os.environ.get("LOCAL_RANK") or 0)},
-        )
-        tokenizer = LlamaTokenizer.from_pretrained(base_model)
-        tokenizer.pad_token_id = 0
-        model.config.pad_token_id = tokenizer.pad_token_id
-        tokenizer.padding_side = "left"
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16,
+        device_map={"": int(os.environ.get("LOCAL_RANK") or 0)},
+    )
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    tokenizer.add_special_tokens({"pad_token": "<pad>"})
+    model.resize_token_embeddings(len(tokenizer))
+    model.config.pad_token_id = tokenizer.pad_token_id
+    tokenizer.padding_side = "left"
 
     model = prepare_model_for_kbit_training(model)
     config = LoraConfig(
@@ -262,7 +232,6 @@ def train(
         # eval_dataset=val_data,
         data_collator=DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True),
         tau=tau,
-        # loss_type=loss_type,
         args=transformers.TrainingArguments(
             output_dir=output_dir,
             per_device_train_batch_size=micro_batch_size,
@@ -276,21 +245,15 @@ def train(
             optim="adamw_torch",
             logging_strategy="steps",
             logging_steps=0.1,
-            # evaluation_strategy="steps",
-            # eval_steps=0.1,
             save_strategy="steps",
             save_steps=(1 / (num_epochs)),
-            # save_total_limit=10,
             save_on_each_node=False,
             log_on_each_node=False,
-            # load_best_model_at_end=True,
             ddp_find_unused_parameters=False if (world_size != 1) else None,
             report_to="tensorboard",
-            # ddp_backend="nccl",
             local_rank=int(os.environ.get("LOCAL_RANK", -1)),
             seed=seed,
             data_seed=seed,
-            # dataloader_num_workers=2,  # 可能可以设置得更大？
         ),
     )
     model.config.use_cache = False

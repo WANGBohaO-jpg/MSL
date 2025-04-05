@@ -1,26 +1,23 @@
 """
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch train_trie_token_adatau.py --dataset_name Toy --sample 10000 --num_epochs 10 --seed 43
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch train_trie_token_adatau.py --dataset_name Amazon_Books --sample 10000 --num_epochs 10 --seed 43
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch train_trie_token_adatau.py --dataset_name Clothing --sample 10000 --num_epochs 10
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch train_trie_token_adatau.py --dataset_name Office --sample 10000 --num_epochs 10
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch train_trie_token_adatau.py --dataset_name Toy --sample 10000 --num_epochs 10
+
+CUDA_VISIBLE_DEVICES=1 accelerate launch train_trie_token_adatau.py --dataset_name Toy --sample 10000 --num_epochs 10 --batch_size 16
+CUDA_VISIBLE_DEVICES=0 accelerate launch train_trie_token_adatau.py --dataset_name Amazon_Books --sample 10000 --num_epochs 10 --batch_size 16
+
 """
 
 import ast
 import json
 import os
 import pdb
-import random
-import re
 from typing import List, Optional
 
 import fire
-import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
 import transformers
 from accelerate import Accelerator
-from accelerate.utils import gather_object
 
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import Dataset
@@ -38,7 +35,6 @@ from transformers import (
 )
 
 from Trie import Trie
-import torch.nn.functional as F
 import copy
 from torch.nn.utils.rnn import pad_sequence
 from utils import get_prompt
@@ -75,29 +71,20 @@ class CustomTrainer(transformers.Trainer):
     def __init__(
         self,
         *args,
-        average_legal_token_num,
         tau,
         eta,
-        tau_type,
         warm_up,
-        dataset_name,
+        first_valid_token_num,
         alpha,
-        early_stopping,
-        loss_type=0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.loss_type = loss_type
-        self.average_legal_token_num = average_legal_token_num
         self.eta = eta
         self.tau = tau
         self.ada_tau = tau
-        self.tau_type = tau_type
-        self.warm_up = warm_up  # 用于自适应tau的参数
-        self.dataset_name = dataset_name
+        self.warm_up = warm_up
+        self.first_valid_token_num = first_valid_token_num
         self.alpha = alpha
-        self.early_stopping = early_stopping
-        self.patience = 0
 
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
         output_dir = output_dir if output_dir is not None else self.args.output_dir
@@ -153,10 +140,6 @@ class CustomTrainer(transformers.Trainer):
         shift_labels = shift_labels.to(shift_logits.device)
 
         mask = shift_labels != -100
-        # shift_labels = shift_labels[mask]
-        # shift_logits = shift_logits[mask]
-        # shift_constrain_mask = shift_constrain_mask[mask]
-
         num_denominators = shift_constrain_mask.sum(dim=-1)
         mask = mask & (num_denominators > 1)
 
@@ -166,237 +149,42 @@ class CustomTrainer(transformers.Trainer):
         shift_constrain_mask = shift_constrain_mask[mask]
         num_denominators = num_denominators[mask]
 
-        """训练使用的masked loss"""
-        if self.tau_type == 0:
-            pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1) / self.tau
-            pos_loss = -pos_logits
-            neg_logits = torch.exp(shift_logits / self.tau)
-            neg_loss = torch.log(neg_logits.sum(dim=-1))
-            loss = (pos_loss + neg_loss).mean()
-        elif self.tau_type == -1:
-            pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1) / self.tau
-            pos_loss = -pos_logits
-            neg_logits = torch.exp(shift_logits / self.tau)
-            neg_loss = torch.log(neg_logits.sum(dim=-1))
-            loss = (pos_loss + neg_loss)[num_denominators > 10].mean()
-        elif self.tau_type == -2:
-            tau0 = self.tau
+        legal_token_num = shift_constrain_mask.sum(dim=1)
+        """To ensure computational efficiency, we calculate the mean and variance only on the samples corresponding to the first token in the sequence."""
+        mask_row = legal_token_num == self.first_valid_token_num
+        average_legal_token_num = torch.tensor(self.first_valid_token_num).cuda()
 
-            pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
-            prob = torch.exp(pos_logits / tau0) / torch.exp(shift_logits / tau0).sum(dim=-1)
+        pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
+        pos_logits = pos_logits[mask_row]
+        neg_logits = shift_logits[mask_row][torch.isfinite(shift_logits[mask_row])]
+        all_pos_logits = self.gather_valid_data(pos_logits)
+        all_neg_logits = self.gather_valid_data(neg_logits)
 
-            # shift_logits_nan = shift_logits.masked_fill(torch.isinf(shift_logits), float("nan"))
-            # mean_logits = torch.nanmean(shift_logits_nan, dim=1)
+        pos_mu = all_pos_logits.mean()
+        neg_mu = all_neg_logits.mean()
+        neg_var = all_neg_logits.var()
 
-            # p_tau = torch.exp(shift_logits) / torch.exp(shift_logits).sum(dim=-1, keepdim=True)
-            p_tau = torch.exp(shift_logits / tau0) / torch.exp(shift_logits / tau0).sum(dim=-1, keepdim=True)
-            E_logits = (shift_logits * p_tau).nansum(dim=-1)
-            diff_logits = E_logits - pos_logits
-            # diff_logits = mean_logits - pos_logits
-            prob_diff_logits = prob * diff_logits
+        diff_mu = pos_mu - neg_mu
 
-            tau_grad = 2 * (prob.mean() - self.eta) * (prob_diff_logits).sum() / (tau0**2 * pos_logits.size(0))
-            tau = tau0 - self.alpha * tau_grad
-            tau = torch.clamp(tau, 1, 5)
+        C = torch.log(average_legal_token_num * self.eta)
+        temp_value = diff_mu**2 - 2 * C * neg_var
+        temp_value = torch.clamp(temp_value, 0)
+        tau = (diff_mu + torch.sqrt(temp_value)) / (2 * C)
 
-            all_gpu_tau = self.accelerator.gather(tau)
-            # print(all_gpu_tau)
-            self.tau = all_gpu_tau.mean().detach().item()
+        tau = torch.clamp(tau, 1.5, 5)
+        tau = tau.detach()
+        tau = self.ada_tau * (1 - self.alpha) + tau * self.alpha
+        self.ada_tau = tau
 
-            pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1) / self.tau
-            pos_loss = -pos_logits
-            neg_logits = torch.exp(shift_logits / self.tau)
-            neg_loss = torch.log(neg_logits.sum(dim=-1))
-            loss = (pos_loss + neg_loss).mean()
-            self.log({"tau": self.tau, "tau_grad": tau_grad.item(), "prob": prob.mean().item()})
-        elif self.tau_type == -3:
-            pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
-            pos_loss = -pos_logits
-            neg_logits = torch.exp(shift_logits_cp)
-            neg_loss = torch.log(neg_logits.sum(dim=-1))
-            loss = (pos_loss + neg_loss)[num_denominators > 10].mean()
-        elif self.tau_type == -4:
-            pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
-            pos_loss = -pos_logits
-            neg_logits = torch.exp(shift_logits_cp)
-            neg_loss = torch.log(neg_logits.sum(dim=-1))
-            loss = (pos_loss + neg_loss).mean()
-        elif self.tau_type == 2:
-            """分析部分，自适应的tau，用合法token数小于某个值的样本"""
-            legal_token_num = shift_constrain_mask.sum(dim=1)
-            mask_row = legal_token_num < 100
-            
-            legal_token_num = legal_token_num[mask_row]
-            all_legal_token_num = self.gather_valid_data(legal_token_num)
-            average_legal_token_num = all_legal_token_num.mean()
+        if self.warm_up != -1 and current_step < self.warm_up:
+            tau = self.tau
+            self.ada_tau = self.tau
 
-            if self.dataset_name == "amazon_game":
-                # mask_row = legal_token_num == 50
-                # average_legal_token_num = torch.tensor(50).cuda()
-                ideal_tau = 1.5
-            elif self.dataset_name == "Toy":
-                # mask_row = legal_token_num == 46
-                # average_legal_token_num = torch.tensor(46).cuda()
-                ideal_tau = 4.5
-            elif self.dataset_name == "Amazon_Books":
-                # mask_row = legal_token_num == 64
-                # average_legal_token_num = torch.tensor(64).cuda()
-                ideal_tau = 1.5
-            elif self.dataset_name == "Clothing":
-                # mask_row = legal_token_num == 53
-                # average_legal_token_num = torch.tensor(53).cuda()
-                ideal_tau = 4
-
-            # 多卡计算
-            pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
-            pos_logits = pos_logits[mask_row]
-            neg_logits = shift_logits[mask_row][torch.isfinite(shift_logits[mask_row])]
-            all_pos_logits = self.gather_valid_data(pos_logits)
-            all_neg_logits = self.gather_valid_data(neg_logits)
-            pos_mu = all_pos_logits.mean()
-            neg_mu = all_neg_logits.mean()
-            neg_var = all_neg_logits.var()
-
-            diff_mu = pos_mu - neg_mu
-
-            C = torch.log(average_legal_token_num * self.eta)
-            temp_value = diff_mu**2 - 2 * C * neg_var
-            temp_value = torch.clamp(temp_value, 0)
-            tau = (diff_mu + torch.sqrt(temp_value)) / (2 * C)
-            
-            self.log({"tau": tau.item()})
-
-            if temp_value == 0:
-                ideal_eta = torch.exp(diff_mu / 2 * ideal_tau) / average_legal_token_num
-            else:
-                ideal_eta = torch.exp(diff_mu / ideal_tau - neg_var / (2 * ideal_tau**2)) / average_legal_token_num
-
-            tau = torch.clamp(tau, 1.5, 5)
-            tau = tau.detach()
-            tau = self.ada_tau * (1 - self.alpha) + tau * self.alpha
-            self.ada_tau = tau
-
-            # 日志可视化
-            self.log(
-                {
-                    "EMA_tau": tau.item(),
-                    "neg_var": neg_var.item(),
-                    "diff_mu": diff_mu.item(),
-                    "temp_value": temp_value.item(),
-                    "C": C.item(),
-                    "legal_token_num": average_legal_token_num.item(),
-                    "ideal_eta": ideal_eta.item(),
-                }
-            )
-
-            # 自适应tau
-            if self.warm_up != -1 and current_step < self.warm_up:
-                tau = self.tau
-                self.ada_tau = self.tau
-
-            pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1) / tau
-            pos_loss = -pos_logits
-            neg_logits = torch.exp(shift_logits / tau)
-            neg_loss = torch.log(neg_logits.sum(dim=-1))
-            loss = tau * (pos_loss + neg_loss).mean()
-            # loss = (pos_loss + neg_loss).mean()
-        elif self.tau_type == 1:
-            """分析部分，自适应的tau"""
-            legal_token_num = shift_constrain_mask.sum(dim=1)
-
-            if self.dataset_name == "amazon_game":
-                mask_row = legal_token_num == 50
-                average_legal_token_num = torch.tensor(50).cuda()
-                ideal_tau = 1.5
-            elif self.dataset_name == "Toy":
-                mask_row = legal_token_num == 46
-                average_legal_token_num = torch.tensor(46).cuda()
-                ideal_tau = 4.5
-            elif self.dataset_name == "Amazon_Books":
-                mask_row = legal_token_num == 64
-                average_legal_token_num = torch.tensor(64).cuda()
-                ideal_tau = 1.5
-            elif self.dataset_name == "Clothing":
-                mask_row = legal_token_num == 53
-                average_legal_token_num = torch.tensor(53).cuda()
-                ideal_tau = 4
-            elif self.dataset_name == "Office":
-                mask_row = legal_token_num == 24
-                average_legal_token_num = torch.tensor(24).cuda()
-                ideal_tau = 3
-
-            # 多卡计算
-            pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
-            pos_logits_cp = shift_logits_cp.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
-            probabilities = torch.exp(pos_logits) / torch.exp(shift_logits).sum(dim=-1)
-            probabilities_cp = torch.exp(pos_logits_cp) / torch.exp(shift_logits_cp).sum(dim=-1)
-            diff_prob = probabilities[mask_row] - probabilities_cp[mask_row]
-            diff_prob_mean = diff_prob.mean()
-            prob_mean = probabilities[mask_row].mean()
-
-            pos_logits = pos_logits[mask_row]
-            neg_logits = shift_logits[mask_row][torch.isfinite(shift_logits[mask_row])]
-            all_pos_logits = self.gather_valid_data(pos_logits)
-            all_neg_logits = self.gather_valid_data(neg_logits)
-            pos_mu = all_pos_logits.mean()
-            neg_mu = all_neg_logits.mean()
-            neg_var = all_neg_logits.var()
-
-            # pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
-            # pos_mu = pos_logits[mask_row].mean()
-            # neg_mu = shift_logits[mask_row][torch.isfinite(shift_logits[mask_row])].mean()
-            # pos_var = torch.var(pos_logits[mask_row])
-            # neg_var = torch.var(shift_logits[mask_row][torch.isfinite(shift_logits[mask_row])])
-            # pos_mu = pos_logits.mean()
-            # neg_mu = shift_logits[torch.isfinite(shift_logits)].mean()
-            # pos_var = torch.var(pos_logits)
-            # neg_var = torch.var(shift_logits[torch.isfinite(shift_logits)])
-
-            diff_mu = pos_mu - neg_mu
-
-            C = torch.log(average_legal_token_num * self.eta)
-            temp_value = diff_mu**2 - 2 * C * neg_var
-            temp_value = torch.clamp(temp_value, 0)
-            tau = (diff_mu + torch.sqrt(temp_value)) / (2 * C)
-            
-            self.log({"tau": tau.item()})
-
-            if temp_value == 0:
-                ideal_eta = torch.exp(diff_mu / 2 * ideal_tau) / average_legal_token_num
-            else:
-                ideal_eta = torch.exp(diff_mu / ideal_tau - neg_var / (2 * ideal_tau**2)) / average_legal_token_num
-
-            tau = torch.clamp(tau, 1.5, 5)
-            tau = tau.detach()
-            tau = self.ada_tau * (1 - self.alpha) + tau * self.alpha
-            self.ada_tau = tau
-
-            # 日志可视化
-            self.log(
-                {
-                    "EMA_tau": tau.item(),
-                    "neg_var": neg_var.item(),
-                    "diff_mu": diff_mu.item(),
-                    "temp_value": temp_value.item(),
-                    "C": C.item(),
-                    "diff_prob_mean": diff_prob_mean.item(),
-                    "prob_mean": prob_mean.item(),
-                    "legal_token_num": average_legal_token_num.item(),
-                    "ideal_eta": ideal_eta.item(),
-                }
-            )
-
-            # 自适应tau
-            if self.warm_up != -1 and current_step < self.warm_up:
-                tau = self.tau
-                self.ada_tau = self.tau
-
-            pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1) / tau
-            pos_loss = -pos_logits
-            neg_logits = torch.exp(shift_logits / tau)
-            neg_loss = torch.log(neg_logits.sum(dim=-1))
-            loss = tau * (pos_loss + neg_loss).mean()
-            # loss = (pos_loss + neg_loss).mean()
+        pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1) / tau
+        pos_loss = -pos_logits
+        neg_logits = torch.exp(shift_logits / tau)
+        neg_loss = torch.log(neg_logits.sum(dim=-1))
+        loss = tau * (pos_loss + neg_loss).mean()
 
         return (loss, outputs) if return_outputs else loss
 
@@ -428,8 +216,8 @@ class Prompt_dataset(Dataset):
 
 
 def train(
+    dataset_name: str,
     base_model: str = "/c23034/wbh/Llama3_Checkpoints/",
-    dataset_name: str = "amazon_game",
     sample: int = -1,
     seed: int = 42,
     # training hyperparams
@@ -445,30 +233,24 @@ def train(
         "q_proj",
         "v_proj",
     ],
-    # train_on_inputs: int = 0,
-    # 额外的loss参数
-    # loss_type: int = 0,
+    # loss hyperparams
     tau: float = 1.5,
     eta: float = 0.25,
-    tau_type: int = 1,
     warm_up: int = -1,
     alpha: float = 0.05,
-    early_stopping: int = 0,
 ):
     params = locals()
     transformers.set_seed(seed)
     accelerator = Accelerator()
 
-    model_name = re.search(r"Llama[^_]+", base_model).group(0)
-
     instruction_prompt, history_prompt = get_prompt(dataset_name)
 
-    id2title_path = os.path.join("/c23034/wbh/code/CBS_LLM4Rec/data/", dataset_name, "id2name4Rec.json")
+    id2title_path = os.path.join("./data/", dataset_name, "id2name4Rec.json")
     with open(id2title_path, "r") as file:
         data = json.load(file)
     id2title_dict = {int(k): v for k, v in data.items()}
 
-    train_data_path = os.path.join("/c23034/wbh/code/CBS_LLM4Rec/data/", dataset_name, f"train_{sample}.csv")
+    train_data_path = os.path.join("./data/", dataset_name, f"train_{sample}.csv")
     train_data = generate_list_from_csv(
         train_data_path=train_data_path,
         id2title_dict=id2title_dict,
@@ -476,11 +258,7 @@ def train(
         input_prefix_str=history_prompt,
     )
 
-    father_path = os.path.join(
-        f"/c23034/wbh/code/CBS_LLM4Rec/save_lora_model_tau_{model_name}",
-        dataset_name,
-        f"sample{sample}_epoch{num_epochs}_eta{eta}_alpha{alpha}_tau{tau}_warmup{warm_up}",
-    )
+    father_path = os.path.join(f"./save_lora_model_tau", dataset_name, f"sample{sample}_epoch{num_epochs}")
     i = 0
     output_dir = os.path.join(father_path, str(i))
     while os.path.exists(output_dir):
@@ -497,7 +275,6 @@ def train(
     micro_batch_size = batch_size // world_size
     gradient_accumulation_steps = batch_size // micro_batch_size // world_size
 
-    """加载了预训练的模型和对应的分词器"""
     bnb_config = BitsAndBytesConfig(load_in_8bit=True)
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
@@ -559,7 +336,6 @@ def train(
 
         tokenized_full_prompt["labels"] = [-100] * user_prompt_len + tokenized_full_prompt["labels"][user_prompt_len:]
 
-        # 开始计算constrain mask
         input_ids = tokenized_full_prompt["input_ids"]
         constrain_mask = torch.ones(size=(len(input_ids) - user_prompt_len, vocab_size), dtype=torch.bool)
 
@@ -573,7 +349,6 @@ def train(
             return None
 
         title_tokens = input_ids[response_idx_end:]
-        # 返回一个和title_tokens长度相同的list，其中每个list元素是对应位置的token space，最后一个是空列表所以删去
         allowed_tokens_list = trie.valid_tokens(title_tokens)[:-1]
         assert constrain_mask.shape[0] == len(allowed_tokens_list)
 
@@ -586,38 +361,18 @@ def train(
         return tokenized_full_prompt
 
     train_data = [generate_and_tokenize_prompt(sample) for sample in tqdm(train_data) if sample is not None]
-    # 计算平均合法token数量
-    constrain_mask_list = [sample["constrain_mask"] for sample in train_data]
-    legal_token_num_list = [mask.sum(dim=1) for mask in constrain_mask_list]
-    legal_token_num = torch.cat(legal_token_num_list)
-    # legal_token_num = legal_token_num[legal_token_num > 1]
-    average_legal_token_num = legal_token_num.sum() / legal_token_num.size(0)
-    print("average_legal_token_num: ", average_legal_token_num)
-    # pdb.set_trace()
-
-    if dataset_name == "amazon_game":
-        average_legal_token_num = torch.tensor(1257).to(accelerator.device)
-    elif dataset_name == "Toy":
-        average_legal_token_num = torch.tensor(883).to(accelerator.device)
-    elif dataset_name == "Amazon_Books":
-        average_legal_token_num = torch.tensor(1182).to(accelerator.device)
-
+    first_valid_token_num = train_data[0]["constrain_mask"].sum(dim=1)[0]
     train_data = Prompt_dataset(train_data)
 
     trainer = CustomTrainer(
         model=model,
         train_dataset=train_data,
-        # eval_dataset=val_data,
         data_collator=CustomDataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8),
-        # loss_type=loss_type,
-        average_legal_token_num=average_legal_token_num,
         tau=tau,
         eta=eta,
-        tau_type=tau_type,
         alpha=alpha,
         warm_up=warm_up,
-        dataset_name=dataset_name,
-        early_stopping=early_stopping,
+        first_valid_token_num=first_valid_token_num,
         args=transformers.TrainingArguments(
             output_dir=output_dir,
             per_device_train_batch_size=micro_batch_size,
@@ -631,22 +386,15 @@ def train(
             optim="adamw_torch",
             logging_strategy="steps",
             logging_steps=0.1,
-            # evaluation_strategy="steps",
-            # eval_steps=0.1,
             save_strategy="steps",
             save_steps=(1 / num_epochs),
-            # save_steps=(1 / (4 * num_epochs)),
-            # save_total_limit=10,
             save_on_each_node=False,
             log_on_each_node=False,
-            # load_best_model_at_end=True,
             ddp_find_unused_parameters=False if (world_size != 1) else None,
             report_to="tensorboard",
-            # ddp_backend="nccl",
             local_rank=int(os.environ.get("LOCAL_RANK", -1)),
             seed=seed,
             data_seed=seed,
-            # dataloader_num_workers=2,  # 可能可以设置得更大？
             remove_unused_columns=False,
         ),
     )
