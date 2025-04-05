@@ -150,9 +150,9 @@ class CustomTrainer(transformers.Trainer):
         num_denominators = num_denominators[mask]
 
         legal_token_num = shift_constrain_mask.sum(dim=1)
-        """To ensure computational efficiency, we calculate the mean and variance only on the samples corresponding to the first token in the sequence."""
+        """To ensure computational efficiency, we calculate the mean and variance only on the samples corresponding to the first token in each sequence."""
         mask_row = legal_token_num == self.first_valid_token_num
-        average_legal_token_num = torch.tensor(self.first_valid_token_num).cuda()
+        average_legal_token_num = self.first_valid_token_num
 
         pos_logits = shift_logits.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
         pos_logits = pos_logits[mask_row]
