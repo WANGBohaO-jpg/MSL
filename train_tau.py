@@ -1,8 +1,3 @@
-"""
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch /c23034/wbh/code/CBS_LLM4Rec/train_tau.py --dataset_name Toy --sample 10000 --num_epochs 20 --tau 1
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch /c23034/wbh/code/CBS_LLM4Rec/train_tau.py --dataset_name Amazon_Books --sample 10000 --num_epochs 20 --tau 1
-"""
-
 import ast
 import json
 import os

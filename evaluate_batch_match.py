@@ -97,11 +97,11 @@ def generate_result_file(lora_weights_path, predict_path, predict_file_name):
 
 
 def main(lora_weights_father_path: str):
-    checkpoint_path_list, _ = find_checkpoint_dirs(lora_weights_father_path)  # 寻找所有checkpoint文件夹
-    checkpoint_path_list.append(lora_weights_father_path)  # 包括父目录本身
+    checkpoint_path_list, _ = find_checkpoint_dirs(lora_weights_father_path)
+    checkpoint_path_list.append(lora_weights_father_path)
 
     for checkpoint_path in checkpoint_path_list:
-        predict_path_list = find_files_with_prefix(checkpoint_path)  # 寻找每个checkpoint文件夹下面以predict开头的文件
+        predict_path_list = find_files_with_prefix(checkpoint_path)
 
         for predict_path, predict_file_name in predict_path_list:
             print("Begin to evaluate: ", predict_path, predict_file_name)
