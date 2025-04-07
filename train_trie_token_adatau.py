@@ -1,11 +1,3 @@
-"""
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch train_trie_token_adatau.py --dataset_name Toy --sample 10000 --num_epochs 10
-
-CUDA_VISIBLE_DEVICES=1 accelerate launch train_trie_token_adatau.py --dataset_name Toy --sample 10000 --num_epochs 10 --batch_size 16
-CUDA_VISIBLE_DEVICES=0 accelerate launch train_trie_token_adatau.py --dataset_name Amazon_Books --sample 10000 --num_epochs 10 --batch_size 16
-
-"""
-
 import ast
 import json
 import os
