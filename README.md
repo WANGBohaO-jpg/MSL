@@ -3,8 +3,7 @@
 ![Static Badge](https://img.shields.io/badge/Conference-SIGIR2025-FF8C00?label=Conference)
 
 This is the PyTorch implementation for our SIGIR 2025 paper. 
-<!-- > Bohao Wang, Jiawei Chen, Changdong Li, Sheng Zhou, Qihao Shi, Yang Gao, Yan Feng, Chun Chen, Can Wang 2024. MSL: Not All Tokens Are What You Need for Tuning LLM as a Recommender. [arXiv link](https://arxiv.org/abs/2402.12994) -->
-> MSL: Not All Tokens Are What You Need for Tuning LLM as a Recommender
+> Bohao Wang, Feng Liu, Jiawei Chen, Xingyu Lou, Changwang Zhang, Jun Wang, Yuegang Sun, Yan Feng, Chun Chen, Can Wang 2025. MSL: Not All Tokens Are What You Need for Tuning LLM as a Recommender. [arXiv link](https://arxiv.org/abs/2504.04178v1)
 
 ## Dataset
 We follow the sliding window data processing method used in [BIGRec](https://arxiv.org/abs/2308.08434). In the paper, for LLM-based recommendation, we sample 10,000 training instances (train_10000.csv) due to limitations in computational resources, while for traditional recommendation models, we use the full dataset (train.csv).
@@ -38,4 +37,14 @@ python evaluate_batch_match.py --lora_weights_father_path "xxx"
 ```
 
 ## Citation
-Coming Soon
+```
+@misc{wang2025msltokensneedtuning,
+      title={MSL: Not All Tokens Are What You Need for Tuning LLM as a Recommender}, 
+      author={Bohao Wang and Feng Liu and Jiawei Chen and Xingyu Lou and Changwang Zhang and Jun Wang and Yuegang Sun and Yan Feng and Chun Chen and Can Wang},
+      year={2025},
+      eprint={2504.04178},
+      archivePrefix={arXiv},
+      primaryClass={cs.IR},
+      url={https://arxiv.org/abs/2504.04178}, 
+}
+```
