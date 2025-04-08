@@ -37,6 +37,7 @@ python evaluate_batch_match.py --lora_weights_father_path "xxx"
 ```
 
 ## Citation
+If you find the paper useful in your research, please consider citing:
 ```
 @misc{wang2025msltokensneedtuning,
       title={MSL: Not All Tokens Are What You Need for Tuning LLM as a Recommender}, 
